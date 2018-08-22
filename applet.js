@@ -57,7 +57,7 @@ MyApplet.prototype = {
 			}
 
             // allocate all cpu classes
-            cpu_alocator = new CpuDataProviderCreator();
+            let cpu_alocator = new CpuDataProviderCreator();
             let providers = cpu_alocator.generateCpuClasses(CpuDataProvider);
 
             // create the graph core object and store them in a list for easy space allocation
@@ -244,7 +244,7 @@ CpuDataProviderCreator.prototype = {
     generateCpuClasses: function(class_pointer) {
 
         // create the list of classes;
-        cpu_classes_list = [];
+        let cpu_classes_list = [];
 
         // create classes iteratively
         for (let i = 0; i < this.total_cores; ++i) {
