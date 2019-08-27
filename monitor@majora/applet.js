@@ -1,150 +1,297 @@
-// imports
 const Applet = imports.ui.applet;
 const Cinnamon = imports.gi.Cinnamon;
 const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const PopupMenu = imports.ui.popupMenu;
+const Clutter = imports.gi.Clutter;
 const St = imports.gi.St;
 const Cairo = imports.cairo;
 const Main = imports.ui.main;
+const Gettext = imports.gettext;
 const GLib = imports.gi.GLib;
-
-// Width of the applet will be ScaleRatio-times the height of it.
-const ScaleRatio = 2;
-const DefaultWaitTime = 250;
+const Settings = imports.ui.settings;
 
 const UUID = "monitor@majora";
-let NoInstdeps = false;
+let gtopFailed = false;
 
+Gettext.bindtextdomain(UUID, GLib.get_home_dir() + "/.local/share/locale");
+function _(str) {
+    return Gettext.dgettext(UUID, str)
+}
+
+function debug_message(message) {
+    global.logError(message);
+}
+
+let GTop;
 try {
-    var GTop = imports.gi.GTop;
-} catch(e) {
+    GTop = imports.gi.GTop;
+} catch (e) {
     let icon = new St.Icon({
         icon_name: 'utilities-system-monitor',
         icon_type: St.IconType.FULLCOLOR,
         icon_size: 24
     });
     Main.criticalNotify(
-        "Dependence missing",
-        "Please install the GTop package\n" +
+        _("Dependency missing"),
+        _(
+            "Please install the GTop package\n" +
             "\tUbuntu / Mint: gir1.2-gtop-2.0\n" +
             "\tFedora: libgtop2-devel\n" +
-            "\tArch: libgtop\n" +
-    	    "to use the applet %s".format(UUID),
+            "\tArch: libgtop\n" +_("to use the applet %s")
+        ).format(UUID),
         icon
     );
-    NoInstdeps = true;
+    gtopFailed = true;
 }
 
-function MyApplet(metadata, orientation, panel_height) {
-    this._init(metadata, orientation, panel_height);
+function GraphicalHWMonitorApplet(metadata, orientation, panel_height, instance_id) {
+    this._init(metadata, orientation, panel_height, instance_id);
 }
 
-MyApplet.prototype = {
-	__proto__: Applet.IconApplet.prototype,
+GraphicalHWMonitorApplet.prototype = {
+    __proto__: Applet.IconApplet.prototype,
 
-    _init: function (metadata, orientation, panel_height) {
-        Applet.IconApplet.prototype._init.call(this, orientation, panel_height);
+    total_graphs: null,
 
+    _init: function (metadata, orientation, panel_height, instance_id) {
+        Applet.IconApplet.prototype._init.call(this, orientation, panel_height, instance_id);
+
+        this.get_orientation(orientation); // Initialise for panel orientation
+        this.panel_height = panel_height;
         this.graphs = [];
 
-		try {
+        if (gtopFailed) {
+            this.set_applet_icon_path(metadata.path + "/icon.png");
+            this.set_applet_tooltip(metadata.description);
+            return;
+        }
 
-			if (NoInstdeps) {
-                this.set_applet_icon_path(metadata.path + "/icon.png");
-			    this.set_applet_tooltip(metadata.description);
-			    return;
-			}
+        let cpu_alocator = new CpuDataProviderCreator();
+        this.total_graphs = cpu_alocator.total_cores + 2 // swap and mem
 
-            // allocate all cpu classes
-            let cpu_alocator = new CpuDataProviderCreator();
-            let providers = cpu_alocator.generateCpuClasses(CpuDataProvider);
+        this.itemOpenSysMon = new PopupMenu.PopupMenuItem(_("Open System Monitor"));
+        this.itemOpenSysMon.connect("activate", Lang.bind(this, this._runSysMonActivate));
+        this._applet_context_menu.addMenuItem(this.itemOpenSysMon);
 
-            // create the graph core object and store them in a list for easy space allocation
-			providers = providers.concat([
-			    new MemDataProvider(),
-                new SwapDataProvider()
-            ]);
+        this.itemReset = new PopupMenu.PopupMenuItem(_("Restart 'Graphical hardware monitor'"));
+        this.itemReset.connect("activate", Lang.bind(this, this.restartGHW));
+        this._applet_context_menu.addMenuItem(this.itemReset);
 
-            this.graphArea = new St.DrawingArea();
-            this.graphArea.height = this._panelHeight;
-            // Request space for n graphs where w=h*ScaleRatio each
-            this.graphArea.width = (this._panelHeight * ScaleRatio * providers.length);
-            this.graphArea.connect('repaint', Lang.bind(this, this.onGraphRepaint));
+        // Setup the applet settings
+        this.graph_width = 50; // Default width (horizontal panels)
+        this.graph_height = 50; // Default height (vertical panels)
+        this.frequency = 0.25;
+        this.settings = new Settings.AppletSettings(this, metadata.uuid, instance_id);
+        this.settings.bind("graph_width", "graph_width", this.settings_changed);
+        this.settings.bind("graph_height", "graph_height", this.settings_changed);
+        this.settings.bind("frequency", "frequency", this.settings_changed);
 
-			this.actor.add_actor(this.graphArea);
+        let height = this.get_height();
+        let width = this.get_width();
 
-            for (let i = 0; i < providers.length; ++i)
-                this.graphs[i] = new Graph(this.graphArea, providers[i], this._panelHeight);
+        this.graphArea = new St.DrawingArea();
+        if (this.isHorizontal) {
+            this.graphArea.height = height;
+            this.graphArea.width = width * this.total_graphs;
+        } else {
+            this.graphArea.height = height * this.total_graphs;
+            this.graphArea.width = width;
+        }
+        this.graphArea.connect("repaint", Lang.bind(this, this.onGraphRepaint));
+        this.actor.add_actor(this.graphArea);
+        this.setup_graphs(width, height);
 
-			this._update();
-		}
-		catch (e) {
-			global.logError(e);
-		}
-	},
+        this.actor.set_offscreen_redirect(Clutter.OffscreenRedirect.ALWAYS);
+        this.add_update_loop(this.frequency);
+    },
 
-	on_applet_clicked: function(event) {
-		this._runSysMon();
-	},
+    get_height: function() {
+        if (this.isHorizontal)
+            return this.panel_height;
+         else
+            return this.graph_height;
+    },
 
-	_update: function() {
+    get_width: function() {
+        if (this.isHorizontal)
+            return this.graph_width;
+        else
+            return this.panel_height;
+    },
 
-		for (let i = 0; i < this.graphs.length; i++)
-			this.graphs[i].refreshData();
+    setup_graphs: function (width, height) {
 
-		this.graphArea.queue_repaint();
+        // allocate all cpu classes
+        let cpu_alocator = new CpuDataProviderCreator();
+        let providers = cpu_alocator.generateCpuClasses(CpuDataProvider);
 
-		Mainloop.timeout_add(DefaultWaitTime, Lang.bind(this, this._update));
-	},
+        // create the graph core object and store them in a list for easy space allocation
+		providers = providers.concat([
+		    new MemDataProvider(),
+            new SwapDataProvider()
+        ]);
 
-	_runSysMon: function() {
-		let _appSys = Cinnamon.AppSystem.get_default();
-		let _gsmApp = _appSys.lookup_app('gnome-system-monitor.desktop');
-		_gsmApp.activate();
-	},
+        for (let i = 0; i < providers.length; ++i)
+            this.graphs[i] = new Graph(providers[i], width, height, this.isHorizontal);
+
+    },
+
+    change_graph_area_size: function(refresh_graphs = true) {
+        let width = this.get_width();
+        let height = this.get_height();
+
+        if (this.isHorizontal) {
+            this.graphArea.set_width(width * this.total_graphs);
+            this.graphArea.set_height(height);
+        } else {
+            this.graphArea.set_width(width);
+            this.graphArea.set_height(height * this.total_graphs);
+        }
+
+        if (refresh_graphs)
+            this.setup_graphs(width, height);
+
+        return [width, height];
+    },
+
+    get_orientation: function (orientation) {
+        this.orientation = orientation;
+        if (this.versionCompare( GLib.getenv('CINNAMON_VERSION') ,"3.2" ) >= 0 ){
+            if (this.orientation == St.Side.LEFT || this.orientation == St.Side.RIGHT) {
+                this.isHorizontal = false;  // vertical
+            } else {
+                this.isHorizontal = true;   // horizontal
+            }
+        } else {
+            this.isHorizontal = true;  // Do not check unless >= 3.2
+        }
+    },
+
+    on_orientation_changed: function(orientation) {
+        this.get_orientation(orientation);
+        this.change_graph_area_size();
+    },
+
+    on_panel_height_changed: function() {
+        this.panel_height = this._panelHeight
+        let [width, height] = this.change_graph_area_size();
+        this._update();
+    },
+
+    on_applet_removed_from_panel: function() {
+        if (gtopFailed) return;
+        this.remove_update_loop();
+    },
+
+    on_applet_clicked: function(event) {
+        this._runSysMon();
+    },
+
+    add_update_loop: function(frequency) {
+        // Start the update loop and allow updates
+        this.loopId = Mainloop.timeout_add(frequency*1000, Lang.bind(this, this.update));
+        this.shouldUpdate = true;
+    },
+
+    remove_update_loop: function() {
+        // Remove the update loop and stop updates
+        if (this.loopId) {
+            Mainloop.source_remove(this.loopId);
+        }
+        this.shouldUpdate = false;
+    },
+
+    update: function() {
+        Mainloop.idle_add_full(Mainloop.PRIORITY_LOW, () => this._update());
+        return this.shouldUpdate;
+    },
+
+    _update: function() {
+    	for (let i = 0; i < this.graphs.length; i++) {
+            this.graphs[i].refreshData();
+        }
+        this.graphArea.queue_repaint();
+    },
 
     onGraphRepaint: function (area) {
-        try {
-            this.graphArea.height = this._panelHeight;
-            // Request space for n graphs where w=h*ScaleRatio each
-            this.graphArea.width = (this._panelHeight * ScaleRatio * this.graphs.length);
-            for (let index = 0; index < this.graphs.length; index++) {
-                // Set 0s of the graph depending on the index
-                // area.get_context().translate((index * (this._panelHeight * ScaleRatio)), 0);
-                let calculated_offset = (index * (this._panelHeight * ScaleRatio));
-                // Paint it
-                this.graphs[index].paint(area, this._panelHeight, calculated_offset);
-            }
-        } catch (e) {
-            global.logError(e);
+        let [width, height] = [this.get_width(), this.get_height()];
+
+        for (let index = 0; index < this.total_graphs; index++) {
+
+            let calculated_offset = this.isHorizontal ? index * width : index * height;
+
+            this.graphs[index].paint(area, calculated_offset);
         }
+    },
+
+    // Called when the settings have changed
+    settings_changed: function () {
+        this.restartGHW();
+    },
+
+    restartGHW: function() {
+        // Refresh the update loop with the new frequency
+        this.remove_update_loop();
+        this.add_update_loop(this.frequency);
+        this.change_graph_area_size();
+    },
+
+    _runSysMon: function() {
+    	let _appSys = Cinnamon.AppSystem.get_default();
+    	let _gsmApp = _appSys.lookup_app('gnome-system-monitor.desktop');
+    	_gsmApp.activate();
+    },
+
+    _runSysMonActivate: function() {
+        this._runSysMon();
+    },
+
+    // Compare two version numbers (strings) based on code by Alexey Bass (albass)
+    // Takes account of many variations of version numers including cinnamon.
+    versionCompare: function(left, right) {
+        if (typeof left + typeof right != 'stringstring')
+            return false;
+        var a = left.split('.'),
+            b = right.split('.'),
+            i = 0,
+            len = Math.max(a.length, b.length);
+        for (; i < len; i++) {
+            if ((a[i] && !b[i] && parseInt(a[i]) > 0) || (parseInt(a[i]) > parseInt(b[i]))) {
+                return 1;
+            } else if ((b[i] && !a[i] && parseInt(b[i]) > 0) || (parseInt(a[i]) < parseInt(b[i]))) {
+                return -1;
+            }
+        }
+        return 0;
     }
 };
 
-function Graph(area, provider, panel_height) {
-    this._init(area, provider, panel_height);
+function Graph(provider, width, height, horizontal) {
+    this._init(provider, width, height, horizontal);
 }
 
 Graph.prototype = {
 
-    _init: function (_area, _provider, panel_height) {
-        this.width = (panel_height * ScaleRatio) - 3;
+    _init: function (provider, width, height, horizontal) {
+        this.provider = provider;
 
-        this.datas = new Array(this.width);
+        if (horizontal) {
+            this.width = width - 3;     // Adjust for border and space between graphs
+            this.height = height - 2;   // Adjust for border
+        } else {
+            this.width = width - 2;     // Adjust for border
+            this.height = height - 3;   // Adjust for border and space between graphs
+        }
+
+        this.datas = Array(this.width);
 
         for (let i = 0; i < this.datas.length; i++) {
             this.datas[i] = 0;
         }
-
-        this.height = panel_height - 2;
-        this.provider = _provider;
-
     },
 
-    paint: function (area, panel_height, offset) {
-        this.width = (panel_height * ScaleRatio) - 3;
-        this.height = panel_height - 2;
+    paint: function (area, offset) {
         let cr = area.get_context();
 
 		// Border
@@ -213,22 +360,20 @@ Graph.prototype = {
 		cr.setFontSize(7 * global.ui_scale);
         cr.setSourceRGBA(0, 0, 0, 0.5);
 		cr.moveTo(2.5 * global.ui_scale + offset, 7.5 * global.ui_scale);
-		cr.showText(this.provider.getName());
+		cr.showText(this.provider.name);
         cr.setSourceRGBA(1, 1, 1, 1);
 		cr.moveTo(2 * global.ui_scale + offset, 7 * global.ui_scale);
-		cr.showText(this.provider.getName());
+		cr.showText(this.provider.name);
 
     },
 
-	refreshData: function() {
+    refreshData: function() {
+        let data = this.provider.getData() * (this.height - 1);
 
-		let data = this.provider.getData() * (this.height - 1);
-
-		if (this.datas.push(data) > this.width - 2) {
-			this.datas.shift();
-		}
-	}
-
+        if (this.datas.push(data) > this.width - 2) {
+            this.datas.shift();
+        }
+    }
 };
 
 function CpuDataProviderCreator() {
@@ -270,6 +415,7 @@ CpuDataProvider.prototype = {
 		this.usage = 0;
 		this.last_total = 0;
         this.core = chosen_core;
+        this.name = "CPU" + this.core;
 	},
 
 	getData: function() {
@@ -287,11 +433,8 @@ CpuDataProvider.prototype = {
 		}
 
 		return 1 - this.usage;
-	},
-
-	getName: function() {
-		return "CPU" + this.core;
 	}
+
 };
 
 function MemDataProvider() {
@@ -302,17 +445,15 @@ MemDataProvider.prototype = {
 
 	_init: function() {
 		this.gtopMem = new GTop.glibtop_mem();
+        this.name = "MEM"
 	},
 
 	getData: function() {
 		GTop.glibtop_get_mem(this.gtopMem);
 
 		return 1 - (this.gtopMem.buffer + this.gtopMem.cached + this.gtopMem.free) / this.gtopMem.total;
-	},
-
-	getName: function() {
-		return "MEM";
 	}
+
 };
 
 function SwapDataProvider() {
@@ -323,20 +464,18 @@ SwapDataProvider.prototype = {
 
     _init: function() {
         this.gtopSwap = new GTop.glibtop_swap();
+        this.name = "SWP";
     },
 
     getData: function() {
         GTop.glibtop_get_swap(this.gtopSwap);
 
         return (this.gtopSwap.used / this.gtopSwap.total);
-    },
-
-    getName: function() {
-        return "SWP";
     }
 
 }
 
-function main(metadata, orientation, panel_height) {
-    return new MyApplet(metadata, orientation, panel_height);
+
+function main(metadata, orientation, panel_height, instance_id) {
+    return new GraphicalHWMonitorApplet(metadata, orientation, panel_height, instance_id);
 }
